@@ -1,0 +1,91 @@
+COMPOSE ?= docker compose
+PYTHON ?= venv/bin/python
+FRONTEND ?= ../osnova_frontend
+
+# HTTPS=1: Caddy in front with Let's Encrypt certificates (docker-compose.https.yml, DOCUMENTATION.md → Deployment)
+HTTPS_FILE := $(if $(HTTPS),-f docker-compose.https.yml)
+BASE := -f docker-compose.yml $(HTTPS_FILE)
+DATA := -f docker-compose.yml -f docker-compose.datastores.yml $(HTTPS_FILE)
+
+.PHONY: help init strip upgrade install dev dev-all test lint format openapi up-minimal up-standard up-scalable migrate createroot cleanup backup restore down down-volumes logs ps build
+
+help:  ## Show available commands
+	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
+
+init:  ## Write .env for the quick start: standard profile in Docker, random secrets (never overwrites)
+	@python3 scripts/init_env.py
+
+strip:  ## Remove the modules whose flags are off in .env: lists them; ARGS="--apply" removes
+	$(PYTHON) -m scripts.strip $(ARGS)
+
+upgrade:  ## Merge a new release of the template: VERSION=v1.1.0 [UPSTREAM=<git address>]
+	python3 -m scripts.upgrade $(VERSION) $(if $(UPSTREAM),--upstream $(UPSTREAM))
+
+install:  ## Create venv and install all modules + dev tools
+	python3.13 -m venv venv
+	$(PYTHON) -m pip install -r requirements/dev.txt
+
+dev:  ## Run the API locally with auto-reload
+	$(PYTHON) run.py
+
+dev-all:  ## Run the API and the frontend dev server (../osnova_frontend), Ctrl+C stops both
+	@test -d $(FRONTEND) || { echo "Frontend not found at $(FRONTEND): clone osnova_frontend there or set FRONTEND=..."; exit 1; }
+	@test -d $(FRONTEND)/node_modules || npm --prefix $(FRONTEND) install
+	@trap 'trap - INT TERM; kill 0' INT TERM; \
+	$(PYTHON) run.py & \
+	npm --prefix $(FRONTEND) run dev & \
+	wait
+
+test:  ## Run tests
+	$(PYTHON) -m pytest
+
+lint:  ## Check code style
+	$(PYTHON) -m ruff check .
+	$(PYTHON) -m ruff format --check .
+
+format:  ## Fix code style
+	$(PYTHON) -m ruff check . --fix
+	$(PYTHON) -m ruff format .
+
+openapi:  ## Write openapi.json for the frontend client
+	$(PYTHON) -m scripts.openapi
+
+up-minimal:  ## Docker: backend + frontend, no datastores
+	$(COMPOSE) $(BASE) --profile minimal up --build -d
+
+up-standard:  ## Docker: + PostgreSQL + Redis
+	$(COMPOSE) $(DATA) --profile standard up --build -d
+
+up-scalable:  ## Docker: standard with several backend replicas
+	$(COMPOSE) $(DATA) --profile scalable up --build -d --scale backend=3
+
+migrate:  ## Docker: apply database migrations once (standard / scalable)
+	$(COMPOSE) $(DATA) --profile standard run --rm backend alembic upgrade head
+
+createroot:  ## Docker: create the first root user (asks; or ARGS="--email ... --password ...")
+	$(COMPOSE) $(DATA) --profile standard run --rm backend python manage.py createroot $(ARGS)
+
+cleanup:  ## Docker: remove old rows now (Celery beat does it every night)
+	$(COMPOSE) $(DATA) --profile standard run --rm backend python manage.py cleanup
+
+backup:  ## Docker: database (and local files) into backups/ with the date; KEEP_DAYS=N drops older ones
+	@COMPOSE="$(COMPOSE) $(DATA)" KEEP_DAYS="$(KEEP_DAYS)" sh scripts/backup.sh
+
+restore:  ## Docker: restore FILE=backups/... (asks first; CONFIRM=yes skips the question)
+	@COMPOSE="$(COMPOSE) $(DATA)" CONFIRM="$(CONFIRM)" sh scripts/restore.sh "$(FILE)"
+
+# --profile scalable names every service, so their volumes count as the project's too
+down:  ## Stop containers (Caddy too)
+	$(COMPOSE) $(DATA) --profile scalable down --remove-orphans
+
+down-volumes:  ## Stop containers and delete data volumes (with HTTPS=1 the certificates too)
+	$(COMPOSE) $(DATA) --profile scalable down -v --remove-orphans
+
+logs:  ## Follow logs
+	$(COMPOSE) $(DATA) logs -f
+
+ps:  ## List containers
+	$(COMPOSE) $(DATA) ps
+
+build:  ## Build all images
+	$(COMPOSE) $(DATA) --profile scalable build

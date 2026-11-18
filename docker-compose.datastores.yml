@@ -1,0 +1,96 @@
+# The standard and scalable profiles: PostgreSQL, Redis, the Celery worker and beat,
+# reached by their service names whatever the local .env says.
+
+x-datastores: &datastores
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-osnova}:${POSTGRES_PASSWORD:-osnova}@postgres:5432/${POSTGRES_DB:-osnova}
+  REDIS_URL: redis://redis:6379/0
+  CELERY_BROKER_URL: redis://redis:6379/1
+  CELERY_RESULT_BACKEND: redis://redis:6379/1
+
+# strip:begin tasks — `make strip` removes the worker and beat with the tasks module
+x-celery: &celery
+  build:
+    context: .
+    args:
+      REQUIREMENTS: standard
+      EXTRA_REQUIREMENTS: ${EXTRA_REQUIREMENTS:-}
+  profiles: ["standard", "scalable"]
+  restart: unless-stopped
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    <<: *datastores
+    # Migrations are the backend's job (RUN_MIGRATIONS in .env, or make migrate)
+    RUN_MIGRATIONS: "false"
+  depends_on:
+    redis:
+      condition: service_healthy
+# strip:end
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["standard", "scalable"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-osnova}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-osnova}
+      POSTGRES_DB: ${POSTGRES_DB:-osnova}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-osnova}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    profiles: ["standard", "scalable"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      args:
+        REQUIREMENTS: standard
+    environment:
+      <<: *datastores
+      # Rate limits shared by every replica (RATE_LIMIT_STORAGE=memory in .env to keep
+      # them in each process)
+      RATE_LIMIT_STORAGE: ${RATE_LIMIT_STORAGE:-redis}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # strip:begin tasks — `make strip` removes the worker and beat with the tasks module
+  worker:
+    <<: *celery
+    command: ["celery", "-A", "app.modules.tasks.celery_app", "--quiet", "worker", "-l", "info"]
+    # The image health check calls the HTTP API, which the worker does not serve
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.modules.tasks.celery_app inspect ping -d celery@$$HOSTNAME"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+
+  # Sends scheduled tasks (beat_schedule in app/modules/tasks/celery_app.py) to the
+  # worker. Always one instance: a second one would send every task twice.
+  beat:
+    <<: *celery
+    command: ["celery", "-A", "app.modules.tasks.celery_app", "--quiet", "beat", "-l", "info", "-s", "/tmp/celerybeat-schedule"]
+    # The image health check calls the HTTP API, which beat does not serve
+    healthcheck:
+      disable: true
+  # strip:end
+
+volumes:
+  postgres_data:

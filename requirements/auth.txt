@@ -1,0 +1,10 @@
+# Auth module (AUTH_ENABLED): also needed by admin, files, notifications and app/user
+-r db.txt
+fastapi-users[sqlalchemy]==15.0.5
+# Pinned: pulled in by fastapi-users, older releases have known vulnerabilities
+pyjwt==2.15.1
+python-multipart==0.0.33
+# OAuth sign-in (Google): used only when a provider is configured
+httpx-oauth==0.17.0
+# Encryption of stored secrets: channel tokens, OAuth tokens (app/modules/auth/encryption.py)
+cryptography==50.0.2

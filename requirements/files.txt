@@ -1,0 +1,2 @@
+# Files module (FILES_ENABLED)
+-r auth.txt

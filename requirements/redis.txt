@@ -1,0 +1,3 @@
+# Redis client (AUTH_STRATEGY=redis, RATE_LIMIT_STORAGE=redis)
+-r base.txt
+redis==8.1.0

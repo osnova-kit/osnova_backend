@@ -1,0 +1,70 @@
+import logging
+from typing import Any
+
+from fastapi import APIRouter, Body, Request
+from fastapi.concurrency import run_in_threadpool
+from fastapi.exceptions import RequestValidationError
+from pydantic import ValidationError
+
+from app.core.captcha import ProtectionSettings, require_captcha
+from app.core.errors import AppError
+from app.core.forms.delivery import deliver, make_record, receivers
+from app.core.forms.schema import (
+    HONEYPOT_FIELD,
+    Form,
+    FormDescription,
+    FormSubmitResponse,
+    build_model,
+    describe,
+)
+from app.core.i18n import get_language, translate
+from app.core.rate_limit import LimitFromSetting, check_limit, client_address
+from app.core.settings import settings
+from app.forms import FORMS
+
+logger = logging.getLogger(__name__)
+
+forms_by_name: dict[str, Form] = {form.name: form for form in FORMS}
+
+limiter = LimitFromSetting(lambda: settings.get(ProtectionSettings).forms_rate_limit, "forms")
+
+forms_router = APIRouter(prefix="/forms", tags=["Forms"])
+
+
+def _get_form(name: str) -> Form:
+    form = forms_by_name.get(name)
+    if form is None:
+        raise AppError(404, "form_not_found")
+    return form
+
+
+@forms_router.get("/{name}")
+async def get_form(name: str) -> FormDescription:
+    return describe(_get_form(name))
+
+
+@forms_router.post("/{name}")
+async def submit_form(
+    request: Request, name: str, payload: dict[str, Any] = Body(...)
+) -> FormSubmitResponse:
+    form = _get_form(name)
+    await check_limit(limiter, f"{form.name}:{client_address(request)}")
+    success = FormSubmitResponse(message=translate(f"forms.{form.name}.success"))
+
+    if payload.pop(HONEYPOT_FIELD, None):
+        # Answer as usual, so the bot does not learn it was caught
+        logger.info("Form %s: honeypot filled, submission dropped", form.name)
+        return success
+
+    try:
+        data = build_model(form).model_validate(payload)
+    except ValidationError as exc:
+        raise RequestValidationError(exc.errors()) from exc
+    # After the fields: a captcha token works once, a typo must not use it up
+    await require_captcha(request)
+
+    record = make_record(form.name, data.model_dump(), get_language())
+    for receiver in receivers:
+        await receiver(record, request)
+    await run_in_threadpool(deliver, record)
+    return success

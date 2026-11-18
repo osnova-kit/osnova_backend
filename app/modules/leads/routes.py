@@ -1,0 +1,276 @@
+import json
+import logging
+import uuid
+from collections.abc import AsyncIterator
+from datetime import UTC, date, datetime, timedelta
+from typing import Any, Literal, get_args
+
+from fastapi import APIRouter, Depends, Query, Request, Response
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from sqlalchemy import ColumnElement, String, cast, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.csv_export import Delimiter, csv_response
+from app.core.errors import AppError
+from app.core.forms.schema import FormDescription, describe
+from app.core.i18n import get_language, translate
+from app.forms import FORMS
+from app.modules.admin.audit import Audit, audit_action
+from app.modules.auth.dependencies import require
+from app.modules.auth.models import User
+from app.modules.auth.permissions import ADMIN_ACCESS
+from app.modules.db import app_session, get_async_session, utc_now
+from app.modules.db.query import contains, listed, ordered, sort_options
+from app.modules.entities.models import Entity
+from app.modules.entities.service import ENTITIES_MANAGE, parse_params
+from app.modules.leads.channels import GROUP, LeadMessage
+from app.modules.leads.delivery import answer, utc_iso
+from app.modules.leads.models import Lead, LeadStatus
+from app.modules.leads.permissions import LEADS_EXPORT, LEADS_MANAGE, LEADS_READ
+
+logger = logging.getLogger(__name__)
+
+leads_router = APIRouter(dependencies=[Depends(require(ADMIN_ACCESS, LEADS_READ))])
+manage = [Depends(require(LEADS_MANAGE))]
+
+LEADS_UPDATE = audit_action("leads.update")
+LEADS_DELETE = audit_action("leads.delete")
+LEADS_EXPORT_ACTION = audit_action("leads.export")
+
+SORT_COLUMNS = {"created_at": Lead.created_at, "form": Lead.form, "status": Lead.status}
+LeadSort = sort_options(SORT_COLUMNS)
+STATUSES: tuple[str, ...] = get_args(LeadStatus)
+
+
+class LeadDelivery(BaseModel):
+    channel: str
+    type: str
+    status: Literal["sent", "failed"]
+    error: str | None
+    final: bool = False
+    at: datetime
+
+
+class LeadRead(BaseModel):
+    id: uuid.UUID
+    form: str
+    data: dict[str, Any]
+    language: str
+    status: LeadStatus
+    created_at: datetime
+    deliveries: dict[str, LeadDelivery]
+
+
+class ChannelTestResult(BaseModel):
+    ok: bool
+    error: str | None
+
+
+class LeadPage(BaseModel):
+    items: list[LeadRead]
+    total: int
+
+
+class LeadUpdate(BaseModel):
+    status: LeadStatus
+
+
+class LeadDay(BaseModel):
+    date: date
+    count: int
+
+
+class LeadStats(BaseModel):
+    total: int
+    by_status: dict[str, int]
+    by_day: list[LeadDay]
+
+
+@leads_router.get("/forms")
+async def lead_forms() -> list[FormDescription]:
+    return [describe(form) for form in FORMS]
+
+
+@leads_router.get("/stats")
+async def lead_stats(
+    days: int = Query(14, ge=1, le=90, description="Length of the by_day period"),
+    session: AsyncSession = Depends(get_async_session),
+) -> LeadStats:
+    by_status = dict(
+        (await session.execute(select(Lead.status, func.count()).group_by(Lead.status))).all()
+    )
+    today = datetime.now(UTC).date()
+    first = today - timedelta(days=days - 1)
+    day = func.date(Lead.created_at)
+    rows = await session.execute(
+        select(day, func.count())
+        .where(Lead.created_at >= datetime.combine(first, datetime.min.time()))
+        .group_by(day)
+    )
+    # PostgreSQL returns a date, SQLite a "YYYY-MM-DD" string
+    counts = {str(value)[:10]: count for value, count in rows.all()}
+    period = [first + timedelta(days=offset) for offset in range(days)]
+    return LeadStats(
+        total=sum(by_status.values()),
+        by_status={status: by_status.get(status, 0) for status in STATUSES},
+        by_day=[LeadDay(date=item, count=counts.get(str(item), 0)) for item in period],
+    )
+
+
+@leads_router.post("/channels/{channel_id}/test", dependencies=[Depends(require(ENTITIES_MANAGE))])
+async def test_channel(
+    channel_id: uuid.UUID, session: AsyncSession = Depends(get_async_session)
+) -> ChannelTestResult:
+    entity = await session.get(Entity, channel_id)
+    channel = parse_params(entity) if entity else None
+    if entity is None or channel is None or channel.group != GROUP:
+        raise AppError(404, "not_found")
+    message = LeadMessage(
+        id=str(uuid.uuid4()),
+        form="test",
+        title=translate("leads.test_title"),
+        language=get_language(),
+        created_at=utc_iso(utc_now()),
+        fields=[(translate("leads.test_field"), translate("leads.test_text"))],
+        data={"test": True},
+    )
+    try:
+        await run_in_threadpool(channel.send, message)  # type: ignore[attr-defined]
+    except Exception as exc:
+        return ChannelTestResult(ok=False, error=f"{type(exc).__name__}: {exc}"[:500])
+    return ChannelTestResult(ok=True, error=None)
+
+
+def _conditions(q: str, form: str | None, status: str | None) -> list[ColumnElement[bool]]:
+    conditions: list[ColumnElement[bool]] = []
+    if search := q.strip():
+        conditions.append(contains(cast(Lead.data, String), search))
+    if forms := listed(form, (item.name for item in FORMS)):
+        conditions.append(Lead.form.in_(forms))
+    if statuses := listed(status, STATUSES):
+        conditions.append(Lead.status.in_(statuses))
+    return conditions
+
+
+@leads_router.get("")
+async def list_leads(
+    q: str = Query("", max_length=100, description="Text anywhere in the submitted data"),
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
+    sort: LeadSort = "-created_at",  # type: ignore[valid-type]
+    form: str | None = Query(None, description="Comma-separated form names"),
+    status: str | None = Query(None, description="Comma-separated: new, done"),
+    session: AsyncSession = Depends(get_async_session),
+) -> LeadPage:
+    conditions = _conditions(q, form, status)
+    total = await session.scalar(select(func.count()).select_from(Lead).where(*conditions))
+    result = await session.scalars(
+        select(Lead)
+        .where(*conditions)
+        .order_by(ordered(SORT_COLUMNS, sort), Lead.created_at.desc())
+        .offset((page - 1) * size)
+        .limit(size)
+    )
+    return LeadPage(
+        items=[LeadRead.model_validate(lead, from_attributes=True) for lead in result],
+        total=total or 0,
+    )
+
+
+@leads_router.get("/export", response_class=StreamingResponse)
+async def export_leads(
+    request: Request,
+    q: str = Query("", max_length=100, description="Text anywhere in the submitted data"),
+    sort: LeadSort = "-created_at",  # type: ignore[valid-type]
+    form: str | None = Query(None, description="Comma-separated form names"),
+    status: str | None = Query(None, description="Comma-separated: new, done"),
+    delimiter: Delimiter | None = Query(None, description="Default: by the request language"),
+    admin: User = Depends(require(LEADS_EXPORT)),
+    audit: Audit = Depends(),
+    session: AsyncSession = Depends(get_async_session),
+) -> StreamingResponse:
+    """Every lead the list shows with this query, as a CSV file: a column per field of
+    the chosen forms (all forms without the filter), answers as the visitor saw them."""
+
+    filters = {"q": q.strip(), "form": form, "status": status}
+    audit(LEADS_EXPORT_ACTION, changes={key: value for key, value in filters.items() if value})
+    await session.commit()
+    names = listed(form, (item.name for item in FORMS))
+    forms = {item.name: describe(item) for item in FORMS if not names or item.name in names}
+    columns: dict[str, str] = {}
+    options: dict[tuple[str, str], dict[str, str]] = {}
+    for description in forms.values():
+        for field in description.fields:
+            columns.setdefault(field.name, field.label)
+            options[description.name, field.name] = {o.value: o.label for o in field.options}
+    statement = (
+        select(Lead)
+        .where(*_conditions(q, form, status))
+        .order_by(ordered(SORT_COLUMNS, sort), Lead.created_at.desc())
+    )
+
+    async def rows() -> AsyncIterator[list[Any]]:
+        count = 0
+        # Its own session: the request's one may be closed before the file is sent
+        async with app_session(request.app) as session:
+            result = await session.stream_scalars(statement.execution_options(yield_per=500))
+            async for lead in result:
+                count += 1
+                other = {key: value for key, value in lead.data.items() if key not in columns}
+                yield [
+                    lead.created_at,
+                    forms[lead.form].title if lead.form in forms else lead.form,
+                    lead.status,
+                    lead.language,
+                    *(
+                        answer(lead.data.get(name), options.get((lead.form, name), {}))
+                        for name in columns
+                    ),
+                    json.dumps(other, ensure_ascii=False) if other else None,
+                ]
+        logger.info("User %s exported %d leads.", admin.id, count)
+
+    header = [
+        *(translate(f"export.{name}") for name in ("created_at", "form", "status", "language")),
+        *columns.values(),
+        translate("export.other"),
+    ]
+    return csv_response("leads", header, rows(), delimiter)
+
+
+async def _get_lead(session: AsyncSession, lead_id: uuid.UUID) -> Lead:
+    lead = await session.get(Lead, lead_id)
+    if lead is None:
+        raise AppError(404, "not_found")
+    return lead
+
+
+@leads_router.patch("/{lead_id}", dependencies=manage)
+async def update_lead(
+    lead_id: uuid.UUID,
+    changes: LeadUpdate,
+    audit: Audit = Depends(),
+    session: AsyncSession = Depends(get_async_session),
+) -> LeadRead:
+    lead = await _get_lead(session, lead_id)
+    if lead.status != changes.status:
+        status = [lead.status, changes.status]
+        audit(LEADS_UPDATE, target_id=lead.id, target=lead.form, changes={"status": status})
+    lead.status = changes.status
+    await session.commit()
+    return LeadRead.model_validate(lead, from_attributes=True)
+
+
+@leads_router.delete("/{lead_id}", status_code=204, dependencies=manage)
+async def delete_lead(
+    lead_id: uuid.UUID,
+    audit: Audit = Depends(),
+    session: AsyncSession = Depends(get_async_session),
+) -> Response:
+    lead = await _get_lead(session, lead_id)
+    await session.delete(lead)
+    audit(LEADS_DELETE, target_id=lead.id, target=lead.form)
+    await session.commit()
+    return Response(status_code=204)

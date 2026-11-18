@@ -1,0 +1,7 @@
+# Database module (DATABASE_URL)
+-r base.txt
+sqlalchemy[asyncio]==2.0.57
+asyncpg==0.32.0
+alembic==1.20.1
+# manage.py (createroot, cleanup, rotate-secrets)
+typer==0.29.1

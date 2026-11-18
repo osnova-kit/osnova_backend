@@ -1,0 +1,58 @@
+version: 2
+
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      python:
+        patterns: ["*"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+      # fastapi-users-db-sqlalchemy needs SQLAlchemy < 2.1
+      - dependency-name: sqlalchemy
+        update-types: ["version-update:semver-minor"]
+      # Before 1.0 a minor release brings new lint rules
+      - dependency-name: ruff
+        update-types: ["version-update:semver-minor"]
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: monthly
+    ignore:
+      # A new Python release is a decision of its own (ruff target, venv, CI)
+      - dependency-name: python
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: docker-compose
+    directories: ["/", "/.github/ci"]
+    schedule:
+      interval: monthly
+    groups:
+      images:
+        patterns: ["*"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+    commit-message:
+      prefix: "chore(ci)"

@@ -1,0 +1,4 @@
+# Background tasks module (BACKGROUND_TASKS_ENABLED)
+-r base.txt
+celery[redis]==5.7.0
+kombu==5.7.0
