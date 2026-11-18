@@ -1,8 +1,8 @@
 # Core: always installed (minimal profile)
-fastapi==0.162.5
+fastapi==0.163.1
 # Pinned: FastAPI accepts a range, and older releases have known vulnerabilities
 starlette==1.10.0
 uvicorn==0.54.0
-pydantic-settings==2.16.2
+pydantic-settings==2.16.3
 # Pinned: the version changes openapi.json (scripts/openapi.py)
 pydantic==2.14.3
